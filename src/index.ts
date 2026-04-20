@@ -10,7 +10,7 @@ interface Env {
 export class ChemMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "twohalves-chemical-safety",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   async init() {
@@ -349,7 +349,7 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Two Halves Chemical Safety MCP Server",
-          version: "1.0.0",
+          version: "1.1.0",
           status: "healthy",
           tools: [
             "check_chemical",
@@ -357,10 +357,10 @@ export default {
             "search_chemicals",
           ],
           data: {
-            echa_svhc: "251 substances of very high concern",
-            niosh_chemicals: "677+ occupational safety profiles",
-            ghs_classifications: "GHS hazard data",
-            cross_references: "30K cosmetic + 6,450 food additives",
+            echa_svhc: "253 substances of very high concern",
+            niosh_chemicals: "677 occupational safety profiles (REL/PEL/IDLH, NIOSH Pocket Guide)",
+            ghs_classifications: "468,165 GHS hazard classifications (PubChem)",
+            cross_references: "30,553 cosmetic ingredients + 6,450 food additives",
           },
           docs: "https://twohalves.ai",
         }),

@@ -1,7 +1,7 @@
 {
   "name": "chem-mcp-server",
-  "version": "1.0.0",
-  "description": "Chemical Safety & Industrial Regulatory Intelligence MCP Server",
+  "version": "1.1.0",
+  "description": "Chemical Safety & Industrial Regulatory Intelligence MCP Server — 253 ECHA SVHC substances, 677 NIOSH occupational exposure profiles (REL/PEL/IDLH), 468,165 GHS hazard classifications, cross-referenced to 30,553 cosmetic ingredients + 6,450 food additives.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -14,6 +14,7 @@
     "@cloudflare/workers-types": "^4.20260313.1",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "agents": "^0.7.6",
+    "csv-parse": "^6.1.0",
     "wrangler": "^4.73.0",
     "xlsx": "^0.18.5",
     "zod": "^4.3.6"
