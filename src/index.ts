@@ -345,6 +345,15 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
+    // Smithery's MCP client POSTs initialize to root `/` instead of `/mcp`.
+    // Rewrite URL pathname to /mcp so ChemMCP.serve("/mcp") matches the route.
+    if (request.method === "POST" && url.pathname === "/") {
+      const mcpUrl = new URL(request.url);
+      mcpUrl.pathname = "/mcp";
+      const mcpRequest = new Request(mcpUrl.toString(), request);
+      return ChemMCP.serve("/mcp").fetch(mcpRequest, env, ctx);
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
       return new Response(
         JSON.stringify({
@@ -382,7 +391,11 @@ export default {
         "transport": { "type": "streamable-http", "endpoint": "/mcp" },
         "capabilities": { "tools": { "listChanged": true }, "resources": { "subscribe": false, "listChanged": false } },
         "authentication": { "required": false, "schemes": ["bearer"] },
-        "tools": ["dynamic"]
+        "tools": [
+          { "name": "check_chemical", "description": "Look up a chemical substance by name or CAS number. Returns SVHC status, NIOSH occupational exposure data, GHS hazard classification, and cross-referenced safety data." },
+          { "name": "check_svhc_list", "description": "Check one or more chemical substances against the EU ECHA SVHC Candidate List." },
+          { "name": "search_chemicals", "description": "Search across chemical safety databases by keyword — SVHC, NIOSH, GHS, cosmetics, and food additives." }
+        ]
       }, { headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" } });
     }
 
