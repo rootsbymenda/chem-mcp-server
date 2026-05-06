@@ -12,12 +12,15 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@cloudflare/workers-types": "^4.20260313.1",
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "1.26.0",
     "agents": "^0.7.6",
-    "csv-parse": "^6.1.0",
-    "wrangler": "^4.73.0",
-    "xlsx": "^0.18.5",
     "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260313.1",
+    "csv-parse": "^6.1.0",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.88.0",
+    "xlsx": "^0.18.5"
   }
 }

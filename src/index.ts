@@ -7,6 +7,474 @@ interface Env {
   MCP_OBJECT: DurableObjectNamespace;
 }
 
+type DbRow = Record<string, any>;
+
+interface LookupContext {
+  warnings: string[];
+}
+
+const MAX_QUERY_LENGTH = 120;
+const MAX_BATCH_SUBSTANCES = 50;
+const DEFAULT_LIMIT = 10;
+const MAX_SEARCH_RESULTS = 25;
+const RATE_LIMIT_PER_MINUTE = 60;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT_PER_MINUTE) return false;
+  return true;
+}
+
+function rateLimitResponse(): Response {
+  return new Response(JSON.stringify({ error: "Rate limit exceeded. Maximum 60 requests per minute." }), {
+    status: 429,
+    headers: { "Content-Type": "application/json", "Retry-After": "60" },
+  });
+}
+const SELFTEST_CAS = "50-00-0";
+const SELFTEST_NAME = "formaldehyde";
+const CAS_RE = /^\d{1,7}-\d{2}-\d$/;
+
+function normalizeQuery(input: string, maxLength = MAX_QUERY_LENGTH): string {
+  return input.trim().replace(/\s+/g, " ").slice(0, maxLength);
+}
+
+function escapeLike(input: string): string {
+  return input.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+function likePattern(input: string): string {
+  return `%${escapeLike(input)}%`;
+}
+
+function isCasNumber(input: string): boolean {
+  return CAS_RE.test(input);
+}
+
+function genericDbWarning(label: string): string {
+  return `${label}_lookup_unavailable`;
+}
+
+async function safeFirst(
+  env: Env,
+  ctx: LookupContext,
+  label: string,
+  sql: string,
+  ...binds: unknown[]
+): Promise<DbRow | null> {
+  try {
+    const row = await env.DB.prepare(sql).bind(...binds).first<DbRow>();
+    return row ?? null;
+  } catch {
+    ctx.warnings.push(genericDbWarning(label));
+    return null;
+  }
+}
+
+async function safeAll(
+  env: Env,
+  ctx: LookupContext,
+  label: string,
+  sql: string,
+  ...binds: unknown[]
+): Promise<DbRow[]> {
+  try {
+    const result = await env.DB.prepare(sql).bind(...binds).all<DbRow>();
+    return result.results ?? [];
+  } catch {
+    ctx.warnings.push(genericDbWarning(label));
+    return [];
+  }
+}
+
+function jsonToolResponse(payload: unknown) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(payload, null, 2),
+      },
+    ],
+  };
+}
+
+async function lookupCrosswalkByCas(env: Env, ctx: LookupContext, cas: string): Promise<DbRow | null> {
+  return safeFirst(
+    env,
+    ctx,
+    "substance_identifiers",
+    `SELECT cas_number, inci_name, common_name, pubchem_cid, ec_number, inchikey, smiles,
+            molecular_formula, molecular_weight, chebi_id, unii, wikidata_qid, iupac_name
+       FROM substance_identifiers
+      WHERE cas_number = ?
+      LIMIT 1`,
+    cas
+  );
+}
+
+async function lookupCrosswalkByName(env: Env, ctx: LookupContext, query: string): Promise<DbRow | null> {
+  const pattern = likePattern(query);
+  return safeFirst(
+    env,
+    ctx,
+    "substance_identifiers",
+    `SELECT cas_number, inci_name, common_name, pubchem_cid, ec_number, inchikey, smiles,
+            molecular_formula, molecular_weight, chebi_id, unii, wikidata_qid, iupac_name
+       FROM substance_identifiers
+      WHERE inci_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+         OR common_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+      ORDER BY
+        CASE
+          WHEN inci_name = ? COLLATE NOCASE THEN 0
+          WHEN common_name = ? COLLATE NOCASE THEN 1
+          ELSE 2
+        END
+      LIMIT 1`,
+    pattern,
+    pattern,
+    query,
+    query
+  );
+}
+
+async function lookupCosmeticByQuery(env: Env, ctx: LookupContext, query: string, cas: string | null): Promise<DbRow | null> {
+  if (cas) {
+    const byCas = await safeFirst(
+      env,
+      ctx,
+      "ingredients",
+      `SELECT name, inci, cas, safety, eu_status, concern
+         FROM ingredients
+        WHERE cas = ? COLLATE NOCASE
+        LIMIT 1`,
+      cas
+    );
+    if (byCas) return byCas;
+  }
+
+  const pattern = likePattern(query);
+  return safeFirst(
+    env,
+    ctx,
+    "ingredients",
+    `SELECT name, inci, cas, safety, eu_status, concern
+       FROM ingredients
+      WHERE name COLLATE NOCASE LIKE ? ESCAPE '\\'
+         OR inci COLLATE NOCASE LIKE ? ESCAPE '\\'
+      LIMIT 1`,
+    pattern,
+    pattern
+  );
+}
+
+async function lookupFoodAdditiveByQuery(env: Env, ctx: LookupContext, query: string, cas: string | null): Promise<DbRow | null> {
+  if (cas) {
+    const byCas = await safeFirst(
+      env,
+      ctx,
+      "food_additives",
+      `SELECT common_name, e_number, cas_number, safety_score, eu_status, health_concerns
+         FROM food_additives
+        WHERE cas_number = ?
+        LIMIT 1`,
+      cas
+    );
+    if (byCas) return byCas;
+  }
+
+  const pattern = likePattern(query);
+  return safeFirst(
+    env,
+    ctx,
+    "food_additives",
+    `SELECT common_name, e_number, cas_number, safety_score, eu_status, health_concerns
+       FROM food_additives
+      WHERE common_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+      LIMIT 1`,
+    pattern
+  );
+}
+
+async function lookupNioshByCas(env: Env, ctx: LookupContext, cas: string): Promise<DbRow | null> {
+  return safeFirst(
+    env,
+    ctx,
+    "niosh_pocket_guide",
+    `SELECT chemical_name, cas_number, rel, pel, idlh, exposure_routes, symptoms,
+            target_organs, health_hazards, physical_description, synonyms
+       FROM niosh_pocket_guide
+      WHERE cas_number = ?
+      LIMIT 1`,
+    cas
+  );
+}
+
+async function lookupNioshByName(env: Env, ctx: LookupContext, query: string): Promise<DbRow | null> {
+  const pattern = likePattern(query);
+  return safeFirst(
+    env,
+    ctx,
+    "niosh_pocket_guide",
+    `SELECT chemical_name, cas_number, rel, pel, idlh, exposure_routes, symptoms,
+            target_organs, health_hazards, physical_description, synonyms
+       FROM niosh_pocket_guide
+      WHERE chemical_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+         OR synonyms COLLATE NOCASE LIKE ? ESCAPE '\\'
+      LIMIT 1`,
+    pattern,
+    pattern
+  );
+}
+
+async function lookupSvhcByCas(env: Env, ctx: LookupContext, cas: string): Promise<DbRow | null> {
+  return safeFirst(
+    env,
+    ctx,
+    "echa_svhc",
+    `SELECT substance_name, ec_number, cas_number, date_included, reason
+       FROM echa_svhc
+      WHERE cas_number = ?
+      LIMIT 1`,
+    cas
+  );
+}
+
+async function lookupIcscByCas(env: Env, ctx: LookupContext, cas: string): Promise<DbRow | null> {
+  return safeFirst(
+    env,
+    ctx,
+    "icsc_chemicals",
+    `SELECT ghs_pictograms, ghs_signal_word, ghs_hazard_statements,
+            effects_short_term, effects_long_term, routes_of_exposure
+       FROM icsc_chemicals
+      WHERE cas_number = ?
+      LIMIT 1`,
+    cas
+  );
+}
+
+async function lookupGhsByCrosswalk(env: Env, ctx: LookupContext, crosswalk: DbRow | null): Promise<DbRow | null> {
+  if (!crosswalk) return null;
+
+  if (crosswalk.ec_number) {
+    const byEc = await safeFirst(
+      env,
+      ctx,
+      "ghs_classifications",
+      `SELECT pictograms, signal_word, hazard_statements, source_name
+         FROM ghs_classifications
+        WHERE ec_number = ?
+        LIMIT 1`,
+      crosswalk.ec_number
+    );
+    if (byEc) {
+      return { ...byEc, matched_by: "ec_number", matched_identifier: crosswalk.ec_number };
+    }
+  }
+
+  if (crosswalk.pubchem_cid) {
+    const byCid = await safeFirst(
+      env,
+      ctx,
+      "ghs_classifications",
+      `SELECT pictograms, signal_word, hazard_statements, source_name
+         FROM ghs_classifications
+        WHERE pubchem_cid = ?
+        LIMIT 1`,
+      String(crosswalk.pubchem_cid)
+    );
+    if (byCid) {
+      return { ...byCid, matched_by: "pubchem_cid", matched_identifier: String(crosswalk.pubchem_cid) };
+    }
+  }
+
+  return null;
+}
+
+async function resolveChemical(env: Env, ctx: LookupContext, query: string) {
+  if (isCasNumber(query)) {
+    const crosswalk = await lookupCrosswalkByCas(env, ctx, query);
+    return { cas: query, crosswalk };
+  }
+
+  const crosswalk = await lookupCrosswalkByName(env, ctx, query);
+  if (crosswalk?.cas_number) {
+    return { cas: String(crosswalk.cas_number), crosswalk };
+  }
+
+  const niosh = await lookupNioshByName(env, ctx, query);
+  if (niosh?.cas_number) {
+    const cas = String(niosh.cas_number);
+    return { cas, crosswalk: await lookupCrosswalkByCas(env, ctx, cas) };
+  }
+
+  const cosmetic = await lookupCosmeticByQuery(env, ctx, query, null);
+  if (cosmetic?.cas) {
+    const cas = String(cosmetic.cas);
+    return { cas, crosswalk: await lookupCrosswalkByCas(env, ctx, cas) };
+  }
+
+  const foodAdditive = await lookupFoodAdditiveByQuery(env, ctx, query, null);
+  if (foodAdditive?.cas_number) {
+    const cas = String(foodAdditive.cas_number);
+    return { cas, crosswalk: await lookupCrosswalkByCas(env, ctx, cas) };
+  }
+
+  return { cas: null, crosswalk: null };
+}
+
+async function checkChemicalData(env: Env, rawQuery: string) {
+  const query = normalizeQuery(rawQuery);
+  const ctx: LookupContext = { warnings: [] };
+
+  if (!query) {
+    return {
+      error: "empty_query",
+      message: "No chemical name or CAS number provided.",
+    };
+  }
+
+  const resolved = await resolveChemical(env, ctx, query);
+  const cas = resolved.cas;
+
+  const [svhc, niosh, ghs, icsc, cosmetic, foodAdditive] = await Promise.all([
+    cas ? lookupSvhcByCas(env, ctx, cas) : Promise.resolve(null),
+    cas ? lookupNioshByCas(env, ctx, cas) : lookupNioshByName(env, ctx, query),
+    lookupGhsByCrosswalk(env, ctx, resolved.crosswalk),
+    cas ? lookupIcscByCas(env, ctx, cas) : Promise.resolve(null),
+    lookupCosmeticByQuery(env, ctx, query, cas),
+    lookupFoodAdditiveByQuery(env, ctx, query, cas),
+  ]);
+
+  if (!svhc && !niosh && !ghs && !icsc && !cosmetic && !foodAdditive) {
+    return {
+      error: "not_found",
+      query,
+      resolved_cas: cas,
+      message: `No chemical safety data found for "${query}". Try searching by CAS number (e.g. "80-05-7") or exact chemical name.`,
+      data_warnings: [...new Set(ctx.warnings)],
+    };
+  }
+
+  return {
+    query,
+    resolved_cas: cas,
+    crosswalk: resolved.crosswalk
+      ? {
+          cas_number: resolved.crosswalk.cas_number,
+          inci_name: resolved.crosswalk.inci_name,
+          common_name: resolved.crosswalk.common_name,
+          ec_number: resolved.crosswalk.ec_number,
+          pubchem_cid: resolved.crosswalk.pubchem_cid,
+          inchikey: resolved.crosswalk.inchikey,
+        }
+      : null,
+    svhc: svhc
+      ? {
+          status: "SUBSTANCE OF VERY HIGH CONCERN",
+          name: svhc.substance_name,
+          ec_number: svhc.ec_number,
+          cas_number: svhc.cas_number,
+          date_included: svhc.date_included,
+          reason: svhc.reason,
+        }
+      : { status: "Not on SVHC list" },
+    occupational_exposure: niosh
+      ? {
+          substance: niosh.chemical_name,
+          cas: niosh.cas_number,
+          niosh_rel: niosh.rel,
+          osha_pel: niosh.pel,
+          idlh: niosh.idlh,
+          exposure_routes: niosh.exposure_routes,
+          symptoms: niosh.symptoms,
+          target_organs: niosh.target_organs,
+          health_hazards: niosh.health_hazards,
+          physical_description: niosh.physical_description,
+        }
+      : null,
+    ghs_classification: ghs
+      ? {
+          signal_word: ghs.signal_word,
+          hazard_statements: ghs.hazard_statements,
+          pictograms: ghs.pictograms,
+          source_name: ghs.source_name,
+          matched_by: ghs.matched_by,
+          matched_identifier: ghs.matched_identifier,
+        }
+      : null,
+    icsc: icsc
+      ? {
+          ghs_signal_word: icsc.ghs_signal_word,
+          ghs_hazard_statements: icsc.ghs_hazard_statements,
+          ghs_pictograms: icsc.ghs_pictograms,
+          effects_short_term: icsc.effects_short_term,
+          effects_long_term: icsc.effects_long_term,
+          routes_of_exposure: icsc.routes_of_exposure,
+        }
+      : null,
+    cross_references: {
+      in_cosmetics_db: cosmetic
+        ? {
+            name: cosmetic.name,
+            inci: cosmetic.inci,
+            cas: cosmetic.cas,
+            safety: cosmetic.safety,
+            eu_status: cosmetic.eu_status,
+            concern: cosmetic.concern,
+          }
+        : null,
+      in_food_additives_db: foodAdditive
+        ? {
+            name: foodAdditive.common_name,
+            e_number: foodAdditive.e_number,
+            cas: foodAdditive.cas_number,
+            safety_score: foodAdditive.safety_score,
+            eu_status: foodAdditive.eu_status,
+            concerns: foodAdditive.health_concerns,
+          }
+        : null,
+    },
+    data_warnings: [...new Set(ctx.warnings)],
+    source: "Two Halves - twohalves.ai",
+  };
+}
+
+async function runSelftest(env: Env) {
+  const result = await checkChemicalData(env, SELFTEST_NAME);
+  const payload = result as Record<string, any>;
+  const hasRealData = Boolean(
+    payload.resolved_cas === SELFTEST_CAS &&
+      (payload.occupational_exposure || payload.ghs_classification || payload.icsc || payload.svhc?.status === "SUBSTANCE OF VERY HIGH CONCERN")
+  );
+  const ok = !payload.error && hasRealData;
+
+  return {
+    ok,
+    status: ok ? "pass" : "fail",
+    query: SELFTEST_NAME,
+    expected_cas: SELFTEST_CAS,
+    resolved_cas: payload.resolved_cas ?? null,
+    found: {
+      svhc: payload.svhc?.status === "SUBSTANCE OF VERY HIGH CONCERN",
+      niosh: Boolean(payload.occupational_exposure),
+      ghs: Boolean(payload.ghs_classification),
+      icsc: Boolean(payload.icsc),
+      crosswalk: Boolean(payload.crosswalk),
+    },
+    data_warnings: payload.data_warnings ?? [],
+  };
+}
+
 export class ChemMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "twohalves-chemical-safety",
@@ -14,10 +482,9 @@ export class ChemMCP extends McpAgent<Env> {
   });
 
   async init() {
-    // Tool 1: check_chemical — lookup by name or CAS number
     this.server.tool(
       "check_chemical",
-      "Look up a chemical substance by name or CAS number. Returns SVHC status (EU Substances of Very High Concern), NIOSH occupational exposure data (REL, PEL, IDLH), GHS hazard classification, and cross-referenced safety data.",
+      "Look up a chemical substance by name or CAS number. Returns SVHC status, NIOSH occupational exposure data, GHS hazard classification, ICSC safety data, and cross-referenced safety data.",
       {
         query: z
           .string()
@@ -25,138 +492,12 @@ export class ChemMCP extends McpAgent<Env> {
             "Chemical name or CAS number (e.g. 'bisphenol A', '80-05-7', 'formaldehyde')"
           ),
       },
-      async ({ query }) => {
-        const q = query.trim();
-
-        // Check SVHC list
-        const svhc = await this.env.DB.prepare(
-          `SELECT * FROM echa_svhc
-           WHERE substance_name LIKE ? COLLATE NOCASE
-              OR cas_number = ?
-              OR ec_number = ?
-           LIMIT 1`
-        )
-          .bind(`%${q}%`, q, q)
-          .first();
-
-        // Check NIOSH data
-        const niosh = await this.env.DB.prepare(
-          `SELECT * FROM niosh_chemicals
-           WHERE substance_name LIKE ? COLLATE NOCASE
-              OR cas_number = ?
-           LIMIT 1`
-        )
-          .bind(`%${q}%`, q)
-          .first();
-
-        // Check GHS classification
-        const ghs = await this.env.DB.prepare(
-          `SELECT * FROM ghs_classifications
-           WHERE substance_name LIKE ? COLLATE NOCASE
-              OR cas_number = ?
-           LIMIT 1`
-        )
-          .bind(`%${q}%`, q)
-          .first();
-
-        // Also check if it exists in our cosmetics or food databases
-        const cosmetic = await this.env.DB.prepare(
-          `SELECT name, inci, cas, safety, eu_status, concern FROM ingredients
-           WHERE name LIKE ? COLLATE NOCASE OR cas = ? COLLATE NOCASE
-           LIMIT 1`
-        )
-          .bind(`%${q}%`, q)
-          .first();
-
-        const foodAdditive = await this.env.DB.prepare(
-          `SELECT common_name, e_number, cas_number, safety_score, eu_status, health_concerns FROM food_additives
-           WHERE common_name LIKE ? COLLATE NOCASE OR cas_number = ?
-           LIMIT 1`
-        )
-          .bind(`%${q}%`, q)
-          .first();
-
-        if (!svhc && !niosh && !ghs && !cosmetic && !foodAdditive) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify({
-                  error: "not_found",
-                  message: `No chemical safety data found for "${query}". Try searching by CAS number (e.g. '80-05-7') or exact chemical name.`,
-                }),
-              },
-            ],
-          };
-        }
-
-        const result: Record<string, unknown> = {
-          query,
-          svhc: svhc
-            ? {
-                status: "SUBSTANCE OF VERY HIGH CONCERN",
-                name: svhc.substance_name,
-                ec_number: svhc.ec_number,
-                cas_number: svhc.cas_number,
-                date_included: svhc.date_included,
-                reason: svhc.reason,
-              }
-            : { status: "Not on SVHC list" },
-          occupational_exposure: niosh
-            ? {
-                substance: niosh.substance_name,
-                cas: niosh.cas_number,
-                niosh_rel: niosh.niosh_rel,
-                osha_pel: niosh.osha_pel,
-                idlh: niosh.idlh,
-                exposure_routes: niosh.exposure_routes,
-                symptoms: niosh.symptoms,
-                target_organs: niosh.target_organs,
-              }
-            : null,
-          ghs_classification: ghs
-            ? {
-                signal_word: ghs.signal_word,
-                hazard_statements: ghs.hazard_statements,
-                pictograms: ghs.pictograms,
-                h_codes: ghs.h_codes,
-              }
-            : null,
-          cross_references: {
-            in_cosmetics_db: cosmetic
-              ? {
-                  name: cosmetic.name,
-                  inci: cosmetic.inci,
-                  safety: cosmetic.safety,
-                  eu_status: cosmetic.eu_status,
-                  concern: cosmetic.concern,
-                }
-              : null,
-            in_food_additives_db: foodAdditive
-              ? {
-                  name: foodAdditive.common_name,
-                  e_number: foodAdditive.e_number,
-                  safety_score: foodAdditive.safety_score,
-                  eu_status: foodAdditive.eu_status,
-                  concerns: foodAdditive.health_concerns,
-                }
-              : null,
-          },
-          source: "Two Halves — twohalves.ai",
-        };
-
-        return {
-          content: [
-            { type: "text" as const, text: JSON.stringify(result, null, 2) },
-          ],
-        };
-      }
+      async ({ query }) => jsonToolResponse(await checkChemicalData(this.env, query))
     );
 
-    // Tool 2: check_svhc_status — batch check substances against SVHC list
     this.server.tool(
       "check_svhc_list",
-      "Check one or more chemical substances against the EU ECHA SVHC (Substances of Very High Concern) Candidate List. Returns which substances are flagged as SVHC and why (CMR, PBT, vPvB, endocrine disruptor).",
+      "Check one or more chemical substances against the EU ECHA SVHC Candidate List. Name inputs are resolved to CAS first; the SVHC table is queried by CAS.",
       {
         substances: z
           .string()
@@ -165,39 +506,29 @@ export class ChemMCP extends McpAgent<Env> {
           ),
       },
       async ({ substances }) => {
+        const ctx: LookupContext = { warnings: [] };
         const names = substances
           .split(/[,\n]+/)
-          .map((n) => n.trim())
-          .filter(Boolean);
+          .map((n) => normalizeQuery(n))
+          .filter(Boolean)
+          .slice(0, MAX_BATCH_SUBSTANCES);
 
         if (names.length === 0) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify({ error: "empty_list", message: "No substances provided." }),
-              },
-            ],
-          };
+          return jsonToolResponse({ error: "empty_list", message: "No substances provided." });
         }
 
         const results = [];
         let flagged = 0;
 
         for (const name of names) {
-          const svhc = await this.env.DB.prepare(
-            `SELECT * FROM echa_svhc
-             WHERE substance_name LIKE ? COLLATE NOCASE
-                OR cas_number = ?
-             LIMIT 1`
-          )
-            .bind(`%${name}%`, name)
-            .first();
+          const resolved = await resolveChemical(this.env, ctx, name);
+          const svhc = resolved.cas ? await lookupSvhcByCas(this.env, ctx, resolved.cas) : null;
 
           if (svhc) {
             flagged++;
             results.push({
               input: name,
+              resolved_cas: resolved.cas,
               svhc: true,
               name: svhc.substance_name,
               cas: svhc.cas_number,
@@ -208,36 +539,26 @@ export class ChemMCP extends McpAgent<Env> {
           } else {
             results.push({
               input: name,
+              resolved_cas: resolved.cas,
               svhc: false,
             });
           }
         }
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  total_checked: names.length,
-                  svhc_flagged: flagged,
-                  results,
-                  note: "SVHC = Substance of Very High Concern under EU REACH regulation. Inclusion triggers authorization requirements.",
-                  source: "ECHA Candidate List — Two Halves (twohalves.ai)",
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return jsonToolResponse({
+          total_checked: names.length,
+          svhc_flagged: flagged,
+          results,
+          data_warnings: [...new Set(ctx.warnings)],
+          note: "SVHC = Substance of Very High Concern under EU REACH regulation. Inclusion triggers authorization requirements.",
+          source: "ECHA Candidate List - Two Halves (twohalves.ai)",
+        });
       }
     );
 
-    // Tool 3: search_chemicals — search across all chemical safety databases
     this.server.tool(
       "search_chemicals",
-      "Search across chemical safety databases by keyword. Find chemicals by name, CAS number, hazard type, target organ, or symptom. Searches SVHC list, NIOSH data, GHS classifications, and cross-references cosmetics and food additive databases.",
+      "Search across chemical safety databases by keyword. Searches SVHC metadata, NIOSH Pocket Guide, GHS classifications, and ICSC data using current D1 schema.",
       {
         query: z
           .string()
@@ -248,7 +569,7 @@ export class ChemMCP extends McpAgent<Env> {
           .string()
           .optional()
           .describe(
-            "Optional: limit search to 'svhc', 'niosh', 'ghs', or 'all' (default: all)"
+            "Optional: limit search to 'svhc', 'niosh', 'ghs', 'icsc', or 'all' (default: all)"
           ),
         limit: z
           .number()
@@ -256,87 +577,123 @@ export class ChemMCP extends McpAgent<Env> {
           .describe("Max results (1-25, default 10)"),
       },
       async ({ query, database, limit }) => {
-        const maxResults = Math.min(Math.max(limit || 10, 1), 25);
+        const ctx: LookupContext = { warnings: [] };
+        const q = normalizeQuery(query);
+        const maxResults = Math.min(Math.max(limit || DEFAULT_LIMIT, 1), MAX_SEARCH_RESULTS);
         const db = database || "all";
+        const pattern = likePattern(q);
         const results: Record<string, unknown>[] = [];
+        const resolved = q ? await resolveChemical(this.env, ctx, q) : { cas: null, crosswalk: null };
+
+        if (!q) {
+          return jsonToolResponse({ error: "empty_query", message: "No search query provided." });
+        }
 
         if (db === "all" || db === "svhc") {
-          const svhcResults = await this.env.DB.prepare(
-            `SELECT substance_name, cas_number, ec_number, reason, date_included
-             FROM echa_svhc
-             WHERE substance_name LIKE ? COLLATE NOCASE
-                OR reason LIKE ? COLLATE NOCASE
-                OR cas_number LIKE ? COLLATE NOCASE
-             LIMIT ?`
-          )
-            .bind(`%${query}%`, `%${query}%`, `%${query}%`, maxResults)
-            .all();
+          const svhcResults = isCasNumber(q)
+            ? await safeAll(
+                this.env,
+                ctx,
+                "echa_svhc",
+                `SELECT substance_name, cas_number, ec_number, reason, date_included
+                   FROM echa_svhc
+                  WHERE cas_number = ?
+                  LIMIT ?`,
+                q,
+                maxResults
+              )
+            : await safeAll(
+                this.env,
+                ctx,
+                "echa_svhc",
+                `SELECT substance_name, cas_number, ec_number, reason, date_included
+                   FROM echa_svhc
+                  WHERE reason COLLATE NOCASE LIKE ? ESCAPE '\\'
+                     OR cas_number COLLATE NOCASE LIKE ? ESCAPE '\\'
+                     OR ec_number COLLATE NOCASE LIKE ? ESCAPE '\\'
+                  LIMIT ?`,
+                pattern,
+                pattern,
+                pattern,
+                maxResults
+              );
 
-          for (const r of svhcResults.results || []) {
+          for (const r of svhcResults) {
             results.push({ source: "SVHC", ...r });
           }
         }
 
         if (db === "all" || db === "niosh") {
-          const nioshResults = await this.env.DB.prepare(
-            `SELECT substance_name, cas_number, niosh_rel, osha_pel, idlh, symptoms, target_organs
-             FROM niosh_chemicals
-             WHERE substance_name LIKE ? COLLATE NOCASE
-                OR symptoms LIKE ? COLLATE NOCASE
-                OR target_organs LIKE ? COLLATE NOCASE
-                OR cas_number LIKE ? COLLATE NOCASE
-             LIMIT ?`
-          )
-            .bind(`%${query}%`, `%${query}%`, `%${query}%`, `%${query}%`, maxResults)
-            .all();
+          const nioshResults = await safeAll(
+            this.env,
+            ctx,
+            "niosh_pocket_guide",
+            `SELECT chemical_name, cas_number, rel, pel, idlh, symptoms, target_organs
+               FROM niosh_pocket_guide
+              WHERE chemical_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+                 OR symptoms COLLATE NOCASE LIKE ? ESCAPE '\\'
+                 OR target_organs COLLATE NOCASE LIKE ? ESCAPE '\\'
+                 OR cas_number COLLATE NOCASE LIKE ? ESCAPE '\\'
+              LIMIT ?`,
+            pattern,
+            pattern,
+            pattern,
+            pattern,
+            maxResults
+          );
 
-          for (const r of nioshResults.results || []) {
+          for (const r of nioshResults) {
             results.push({ source: "NIOSH", ...r });
           }
         }
 
-        if (db === "all" || db === "ghs") {
-          const ghsResults = await this.env.DB.prepare(
-            `SELECT substance_name, cas_number, signal_word, hazard_statements, h_codes
-             FROM ghs_classifications
-             WHERE substance_name LIKE ? COLLATE NOCASE
-                OR hazard_statements LIKE ? COLLATE NOCASE
-                OR h_codes LIKE ? COLLATE NOCASE
-                OR cas_number LIKE ? COLLATE NOCASE
-             LIMIT ?`
-          )
-            .bind(`%${query}%`, `%${query}%`, `%${query}%`, `%${query}%`, maxResults)
-            .all();
+        if (db === "all" || db === "icsc") {
+          if (resolved.cas) {
+            const icsc = await lookupIcscByCas(this.env, ctx, resolved.cas);
+            if (icsc) results.push({ source: "ICSC", cas_number: resolved.cas, ...icsc });
+          }
+        }
 
-          for (const r of ghsResults.results || []) {
+        if (db === "all" || db === "ghs") {
+          const ghsById = await lookupGhsByCrosswalk(this.env, ctx, resolved.crosswalk);
+          if (ghsById) {
+            results.push({ source: "GHS", cas_number: resolved.cas, ...ghsById });
+          }
+
+          const ghsResults = await safeAll(
+            this.env,
+            ctx,
+            "ghs_classifications",
+            `SELECT pictograms, signal_word, hazard_statements, source_name
+               FROM ghs_classifications
+              WHERE hazard_statements COLLATE NOCASE LIKE ? ESCAPE '\\'
+                 OR signal_word COLLATE NOCASE LIKE ? ESCAPE '\\'
+                 OR source_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+              LIMIT ?`,
+            pattern,
+            pattern,
+            pattern,
+            maxResults
+          );
+
+          for (const r of ghsResults) {
             results.push({ source: "GHS", ...r });
           }
         }
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  query,
-                  database: db,
-                  count: results.length,
-                  results: results.slice(0, maxResults),
-                  source: "Two Halves — twohalves.ai",
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return jsonToolResponse({
+          query: q,
+          database: db,
+          count: results.length,
+          results: results.slice(0, maxResults),
+          data_warnings: [...new Set(ctx.warnings)],
+          source: "Two Halves - twohalves.ai",
+        });
       }
     );
   }
 }
 
-// Worker entry point
 export default {
   async fetch(
     request: Request,
@@ -345,8 +702,12 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    // Smithery's MCP client POSTs initialize to root `/` instead of `/mcp`.
-    // Rewrite URL pathname to /mcp so ChemMCP.serve("/mcp") matches the route.
+    const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+    const isDataEndpoint = url.pathname === "/mcp" || url.pathname === "/sse" || url.pathname.startsWith("/sse/") || (request.method === "POST" && url.pathname === "/");
+    if (isDataEndpoint && !checkRateLimit(clientIp)) {
+      return rateLimitResponse();
+    }
+
     if (request.method === "POST" && url.pathname === "/") {
       const mcpUrl = new URL(request.url);
       mcpUrl.pathname = "/mcp";
@@ -354,29 +715,34 @@ export default {
       return ChemMCP.serve("/mcp").fetch(mcpRequest, env, ctx);
     }
 
+    if (url.pathname === "/selftest") {
+      const result = await runSelftest(env);
+      return Response.json(result, {
+        status: result.ok ? 200 : 500,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+
     if (url.pathname === "/" || url.pathname === "/health") {
-      return new Response(
-        JSON.stringify({
-          name: "Two Halves Chemical Safety MCP Server",
-          version: "1.1.0",
-          status: "healthy",
-          tools: [
-            "check_chemical",
-            "check_svhc_list",
-            "search_chemicals",
-          ],
-          data: {
-            echa_svhc: "253 substances of very high concern",
-            niosh_chemicals: "677 occupational safety profiles (REL/PEL/IDLH, NIOSH Pocket Guide)",
-            ghs_classifications: "468,165 GHS hazard classifications (PubChem)",
-            cross_references: "30,553 cosmetic ingredients + 6,450 food additives",
-          },
-          docs: "https://twohalves.ai",
-        }),
-        {
-          headers: { "Content-Type": "application/json" },
-        }
-      );
+      return Response.json({
+        name: "Two Halves Chemical Safety MCP Server",
+        version: "1.1.0",
+        status: "healthy",
+        tools: [
+          "check_chemical",
+          "check_svhc_list",
+          "search_chemicals",
+        ],
+        data: {
+          echa_svhc: "SVHC lookup by CAS number",
+          niosh_pocket_guide: "NIOSH occupational safety profiles (REL/PEL/IDLH)",
+          ghs_classifications: "GHS hazard classifications resolved through substance_identifiers",
+          icsc_chemicals: "ICSC chemical safety cards by CAS number",
+          cross_references: "cosmetic ingredients + food additives",
+        },
+        selftest: "/selftest",
+        docs: "https://twohalves.ai",
+      });
     }
 
     if (url.pathname === "/.well-known/mcp/server-card.json") {
@@ -385,16 +751,17 @@ export default {
         "version": "1.0",
         "protocolVersion": "2025-06-18",
         "serverInfo": { "name": "chem-mcp-server", "title": "Two Halves Chemical Safety MCP Server", "version": "1.1.0" },
-        "description": "Chemical safety MCP — SVHC, GHS, NIOSH OEL aggregated",
+        "description": "Chemical safety MCP - SVHC, GHS, NIOSH OEL, and ICSC safety data",
         "iconUrl": "https://rootsbybenda.com/icon.png",
         "documentationUrl": "https://rootsbybenda.com",
         "transport": { "type": "streamable-http", "endpoint": "/mcp" },
         "capabilities": { "tools": { "listChanged": true }, "resources": { "subscribe": false, "listChanged": false } },
         "authentication": { "required": false, "schemes": ["bearer"] },
+        "rateLimit": { "requestsPerMinute": 60, "enforcement": "per-ip" },
         "tools": [
-          { "name": "check_chemical", "description": "Look up a chemical substance by name or CAS number. Returns SVHC status, NIOSH occupational exposure data, GHS hazard classification, and cross-referenced safety data." },
-          { "name": "check_svhc_list", "description": "Check one or more chemical substances against the EU ECHA SVHC Candidate List." },
-          { "name": "search_chemicals", "description": "Search across chemical safety databases by keyword — SVHC, NIOSH, GHS, cosmetics, and food additives." }
+          { "name": "check_chemical", "description": "Look up a chemical substance by name or CAS number. Returns SVHC status, NIOSH occupational exposure data, GHS hazard classification, ICSC data, and cross-referenced safety data." },
+          { "name": "check_svhc_list", "description": "Check one or more chemical substances against the EU ECHA SVHC Candidate List by resolving inputs to CAS." },
+          { "name": "search_chemicals", "description": "Search across chemical safety databases by keyword - SVHC, NIOSH, GHS, and ICSC." }
         ]
       }, { headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" } });
     }
