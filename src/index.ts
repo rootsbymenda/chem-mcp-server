@@ -5,7 +5,112 @@ import { z } from "zod";
 interface Env {
   DB: D1Database;
   MCP_OBJECT: DurableObjectNamespace;
+  // Auth env — optional. When configured, validates Bearer tokens for usage tracking
+  // and per-user rate limiting. Without these, all callers are treated as anonymous free tier.
+  MCP_KEY_SECRET?: string;
+  SUPABASE_URL?: string;
+  SUPABASE_SERVICE_ROLE_KEY?: string;
 }
+
+// --- Auth: HMAC-validated MCP key + Supabase plan lookup ---
+// MCP keys are issued by rootsbybenda-site/functions/api/mcp-key.js using the
+// SAME MCP_KEY_SECRET. Format: mcp_<base64url(user_id)>_<sha256_hmac[:32]>.
+// On these public-data servers, auth is for TRACKING and REVOCATION, not tier gating.
+// Unauthenticated callers get full access at free tier.
+
+interface AuthProps extends Record<string, unknown> {
+  tier: "paid" | "free";
+  user_id: string | null;
+  plan: string;
+}
+
+function base64urlDecodeToString(b64url: string): string {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64 + "===".slice((b64.length + 3) % 4);
+  return atob(padded);
+}
+
+async function hmacSha256Hex(message: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+async function resolveAuth(request: Request, env: Env): Promise<AuthProps> {
+  const authHeader = request.headers.get("Authorization") || "";
+  const match = authHeader.match(/^Bearer\s+(mcp_[A-Za-z0-9_-]+_[a-f0-9]{32})\s*$/i);
+  if (!match) return { tier: "free", user_id: null, plan: "anonymous" };
+
+  const key = match[1];
+  const parts = key.split("_");
+  if (parts.length !== 3 || parts[0] !== "mcp") {
+    return { tier: "free", user_id: null, plan: "anonymous" };
+  }
+  const userIdB64 = parts[1];
+  const providedHmac = parts[2].toLowerCase();
+
+  if (!env.MCP_KEY_SECRET) {
+    console.error("resolveAuth: MCP_KEY_SECRET not configured");
+    return { tier: "free", user_id: null, plan: "anonymous" };
+  }
+
+  let userId: string;
+  try {
+    userId = base64urlDecodeToString(userIdB64);
+  } catch {
+    return { tier: "free", user_id: null, plan: "anonymous" };
+  }
+  if (!userId) return { tier: "free", user_id: null, plan: "anonymous" };
+
+  const computed = (await hmacSha256Hex(userId, env.MCP_KEY_SECRET)).slice(0, 32);
+  if (!constantTimeEqual(computed, providedHmac)) {
+    return { tier: "free", user_id: null, plan: "anonymous" };
+  }
+
+  // Valid HMAC — user is authenticated. Look up plan if Supabase is configured.
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return { tier: "free", user_id: userId, plan: "authenticated" };
+  }
+
+  let plan = "free";
+  try {
+    const profileRes = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=plan`,
+      {
+        headers: {
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        },
+      }
+    );
+    if (profileRes.ok) {
+      const profiles = (await profileRes.json()) as Array<{ plan?: string }>;
+      if (profiles.length > 0 && profiles[0].plan) {
+        plan = profiles[0].plan;
+      }
+    }
+  } catch (e) {
+    console.error("resolveAuth: profile lookup failed", e);
+  }
+
+  return { tier: "free", user_id: userId, plan };
+}
+// --- End auth ---
 
 type DbRow = Record<string, any>;
 
@@ -702,13 +807,20 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+    // Resolve auth early — use user_id for rate limiting when authenticated (better for shared IPs)
+    let auth: AuthProps | null = null;
     const isDataEndpoint = url.pathname === "/mcp" || url.pathname === "/sse" || url.pathname.startsWith("/sse/") || (request.method === "POST" && url.pathname === "/");
-    if (isDataEndpoint && !checkRateLimit(clientIp)) {
-      return rateLimitResponse();
+    if (isDataEndpoint) {
+      auth = await resolveAuth(request, env);
+      const rateLimitKey = auth.user_id || request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+      if (!checkRateLimit(rateLimitKey)) {
+        return rateLimitResponse();
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/") {
+      if (!auth) auth = await resolveAuth(request, env);
+      (ctx as ExecutionContext & { props?: AuthProps }).props = auth;
       const mcpUrl = new URL(request.url);
       mcpUrl.pathname = "/mcp";
       const mcpRequest = new Request(mcpUrl.toString(), request);
@@ -756,14 +868,20 @@ export default {
         "documentationUrl": "https://rootsbybenda.com",
         "transport": { "type": "streamable-http", "endpoint": "/mcp" },
         "capabilities": { "tools": { "listChanged": true }, "resources": { "subscribe": false, "listChanged": false } },
-        "authentication": { "required": false, "schemes": ["bearer"] },
-        "rateLimit": { "requestsPerMinute": 60, "enforcement": "per-ip" },
+        "authentication": { "required": false, "schemes": ["bearer"], "note": "Optional API key enables higher rate limits and usage tracking" },
+        "rateLimit": { "requestsPerMinute": 60, "enforcement": "per-ip-or-user" },
         "tools": [
           { "name": "check_chemical", "description": "Look up a chemical substance by name or CAS number. Returns SVHC status, NIOSH occupational exposure data, GHS hazard classification, ICSC data, and cross-referenced safety data." },
           { "name": "check_svhc_list", "description": "Check one or more chemical substances against the EU ECHA SVHC Candidate List by resolving inputs to CAS." },
           { "name": "search_chemicals", "description": "Search across chemical safety databases by keyword - SVHC, NIOSH, GHS, and ICSC." }
         ]
       }, { headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" } });
+    }
+
+    // Resolve auth and set on ctx.props for MCP transport endpoints
+    if (url.pathname === "/sse" || url.pathname.startsWith("/sse/") || url.pathname === "/mcp") {
+      if (!auth) auth = await resolveAuth(request, env);
+      (ctx as ExecutionContext & { props?: AuthProps }).props = auth;
     }
 
     if (url.pathname === "/sse" || url.pathname.startsWith("/sse/")) {
