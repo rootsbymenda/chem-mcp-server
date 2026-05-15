@@ -9,7 +9,7 @@ If you discover a security issue in this MCP server or its tool handlers, please
 - Affected endpoint or code path
 - Your name/handle for credit (optional)
 
-A dedicated `security@twohalves.ai` alias is planned; until it lands, the email above is the canonical disclosure contact.
+A dedicated `security@rootsbybenda.com` alias is planned; until it lands, the email above is the canonical disclosure contact.
 
 ### Response Timeline
 
@@ -31,7 +31,7 @@ A dedicated `security@twohalves.ai` alias is planned; until it lands, the email 
 - Public API endpoints at `chem-mcp-server.rootsbybenda.workers.dev`
 
 ### Out of scope
-- The Roots by Benda / Two Halves D1 database itself (access controlled via authenticated routes on other servers in the fleet)
+- The Roots by Benda D1 database itself (access controlled via Worker bindings and route-level protections)
 - Third-party dependencies (please report upstream; we track CVEs via Dependabot)
 - Social engineering, physical attacks, or attacks requiring previously-stolen credentials
 
@@ -48,13 +48,13 @@ This server queries public regulatory aggregations:
 - **Cosmetic ingredients** (`ingredients` table — public-display fields only: name, INCI, CAS, safety, EU status, concern)
 - **Food additives** (`food_additives` table — public-display fields only: common name, E-number, CAS, safety score, EU status)
 
-**No premium computed values are exposed by this server.** NOAEL studies, Margin of Safety calculations, gold-tier synthesis, and other Roots-computed values are gated behind separate Pro-tier authentication on the Roots by Benda primary server (`roots-mcp-server`), which uses HMAC-validated MCP key authentication and Supabase tier-check.
+All chemical safety data returned by this server is free. The server does not classify callers by plan and does not strip response fields by tier.
 
 ### Authentication Posture
-This server is **unauthenticated** by design — it serves public-sourced regulatory aggregations that align with the public-display moat positioning (display freely, gate computed values elsewhere). No HMAC validation, no tier gating, no secrets required for tool invocation.
+This server accepts optional HMAC-validated MCP keys. A valid key supplies a stable `user_id` for per-user rate limiting; unauthenticated callers still receive full data subject to abuse-prevention rate limits.
 
 ### Secret Management (Worker Bindings)
-Currently no secrets are required for this server's operation. The only Worker binding is the D1 database (`benda-ingredients`), bound via `wrangler.toml` to read public-display tables only. **No secret has ever been committed to source control** — verified via filename scan and content-pattern scan across `master` branch git history; defensive `.gitignore` patterns block accidental future commits of local data dumps.
+The optional HMAC secret is managed via **Cloudflare secret bindings** (`wrangler secret put`). The D1 database (`benda-ingredients`) is bound via `wrangler.toml`. **No secret has ever been committed to source control** — verified via filename scan and content-pattern scan across `master` branch git history; defensive `.gitignore` patterns block accidental future commits of local data dumps.
 
 GitHub push protection and secret scanning are enabled on this public repo (free for public repos).
 
@@ -62,7 +62,7 @@ GitHub push protection and secret scanning are enabled on this public repo (free
 
 ## Public Source — Conscious Decision
 
-This repository is **public-by-design**. Source code visibility serves as the audit trail for technical buyers (regulatory consultants, chemical safety assessors, formulators) who professionally evaluate compliance tooling. The data is sourced from primary regulatory authorities and aggregated via this Worker; the gating logic and query structure are public; the ETL discipline behind the underlying database is the moat — and that discipline is verifiable through this repository.
+This repository is **public-by-design**. Source code visibility serves as the audit trail for technical buyers (regulatory consultants, chemical safety assessors, formulators) who professionally evaluate compliance tooling. The data is sourced from primary regulatory authorities and aggregated via this Worker; query structure and ETL discipline are verifiable through this repository.
 
 This decision was made consciously after structured industry-pattern, security-tradeoff, and brand-positioning evaluation. The full decision rationale is recorded internally; the externally-visible artifact is this repo and its hygiene.
 
