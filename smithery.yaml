@@ -1,0 +1,19 @@
+description: >-
+  Is this chemical SVHC or NIOSH listed? Roots by Benda checks 253 ECHA SVHC substances, 677 NIOSH occupational exposure profiles, 468,165 GHS hazard classifications, 73,252 substance identifiers, ICSC safety cards, and cross-links into 30,553 cosmetic ingredients plus 6,450 food additives. Chemical hazard review across SVHC, GHS, NIOSH, ICSC, and cross-vertical safety in one free MCP. Ask your AI: 'is this chemical SVHC or NIOSH listed?'. Built by one human + Claude. Free. Source-linked.
+startCommand:
+  type: "http"
+  configSchema:
+    type: "object"
+    properties:
+      rootsApiKey:
+        type: "string"
+        title: "Roots API Key"
+        description: "Optional. Supplies a stable user_id for per-user rate limiting; all tools return full data without monetization gates."
+        x-from: "header"
+        x-to:
+          header: "Authorization"
+          prefix: "Bearer "
+    additionalProperties: false
+  exampleConfig:
+    rootsApiKey: "mcp_xxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  deploymentUrl: "https://chem-mcp-server.rootsbybenda.workers.dev"

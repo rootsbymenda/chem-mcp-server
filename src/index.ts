@@ -80,6 +80,51 @@ async function resolveAuth(request: Request, env: Env): Promise<AuthProps> {
 }
 // --- End auth ---
 
+const SERVER_VERSION = "1.1.0";
+const HOMEPAGE = "https://rootsbybenda.com";
+const SOURCE = "Roots by Benda \u2014 rootsbybenda.com";
+const CONTACT = "SBD@effortlessai.ai";
+const SERVER_NAME = "Roots by Benda \u2014 Chemical Intelligence";
+const SERVER_DESCRIPTION =
+  "Roots by Benda answers whether a chemical is SVHC or NIOSH listed by checking 253 ECHA SVHC substances, 677 NIOSH occupational profiles, 468,165 GHS hazard classifications, ICSC safety cards, and cross-links into 30,553 cosmetic ingredients plus 6,450 food additives. It is a free, source-linked chemical hazard MCP for SVHC, GHS, NIOSH REL/PEL/IDLH, ICSC, and cross-vertical safety review; ask your AI: 'is this chemical SVHC or NIOSH listed?'.";
+const DATA_CATALOG = {
+  echa_svhc: "253",
+  niosh_pocket_guide: "677",
+  ghs_classifications: "468,165",
+  substance_identifiers: "73,252",
+  icsc_chemicals: "ICSC chemical safety cards by CAS number",
+  cross_references: "30,553 cosmetic ingredients + 6,450 food additives"
+};
+const TOOL_CATALOG = [
+  {
+    name: "check_chemical",
+    description: "Look up a chemical substance by name or CAS number. Returns EU ECHA SVHC status, NIOSH occupational exposure data (REL/PEL/IDLH), GHS hazard classification, ICSC safety card data, and cosmetic/food cross-references for hazard assessment."
+  },
+  {
+    name: "check_svhc_list",
+    description: "Check one or more chemical substances against the EU ECHA SVHC Candidate List. Resolves names to CAS numbers when possible and returns flagged substances, reasons for inclusion, dates, and source-linked detail URLs."
+  },
+  {
+    name: "search_chemicals",
+    description: "Search chemical safety records by keyword across SVHC, NIOSH, GHS, and ICSC data. Use when an AI agent needs to find hazardous chemicals by effect, exposure route, hazard phrase, organ target, or regulatory status."
+  }
+];
+
+function registryMetadata() {
+  return {
+    name: SERVER_NAME,
+    description: SERVER_DESCRIPTION,
+    version: SERVER_VERSION,
+    mcp_endpoint: "/mcp",
+    tools: TOOL_CATALOG,
+    data: DATA_CATALOG,
+    homepage: HOMEPAGE,
+    source: SOURCE,
+    contact: CONTACT,
+  };
+}
+
+
 type DbRow = Record<string, any>;
 
 interface LookupContext {
@@ -87,11 +132,15 @@ interface LookupContext {
 }
 
 const MAX_QUERY_LENGTH = 120;
+const MAX_QUERY_INPUT_LENGTH = 200;
+const MAX_NAME_LENGTH = 50;
 const MAX_BATCH_SUBSTANCES = 50;
+const MAX_BATCH_INPUT_LENGTH = 4_000;
 const DEFAULT_LIMIT = 10;
 const MAX_SEARCH_RESULTS = 25;
 const RATE_LIMIT_PER_MINUTE = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
+const CHEM_DATABASES = ["all", "svhc", "niosh", "ghs", "icsc"] as const;
 
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
@@ -558,16 +607,19 @@ async function runSelftest(env: Env) {
 export class ChemMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "roots-chemical-safety",
-    version: "1.1.0",
+    version: SERVER_VERSION,
   });
 
   async init() {
     this.server.tool(
       "check_chemical",
-      "Look up a chemical substance by name or CAS number. Returns SVHC status, NIOSH occupational exposure data, GHS hazard classification, ICSC safety data, and cross-referenced safety data.",
+      TOOL_CATALOG[0].description,
       {
         query: z
           .string()
+          .trim()
+          .min(1)
+          .max(MAX_QUERY_INPUT_LENGTH)
           .describe(
             "Chemical name or CAS number (e.g. 'bisphenol A', '80-05-7', 'formaldehyde')"
           ),
@@ -577,10 +629,13 @@ export class ChemMCP extends McpAgent<Env> {
 
     this.server.tool(
       "check_svhc_list",
-      "Check one or more chemical substances against the EU ECHA SVHC Candidate List. Name inputs are resolved to CAS first; the SVHC table is queried by CAS.",
+      TOOL_CATALOG[1].description,
       {
         substances: z
           .string()
+          .trim()
+          .min(1)
+          .max(MAX_BATCH_INPUT_LENGTH)
           .describe(
             "Comma-separated list of chemical names or CAS numbers to check against SVHC list"
           ),
@@ -589,12 +644,17 @@ export class ChemMCP extends McpAgent<Env> {
         const ctx: LookupContext = { warnings: [] };
         const names = substances
           .split(/[,\n]+/)
-          .map((n) => normalizeQuery(n))
-          .filter(Boolean)
-          .slice(0, MAX_BATCH_SUBSTANCES);
+          .map((n) => normalizeQuery(n, MAX_NAME_LENGTH))
+          .filter(Boolean);
 
         if (names.length === 0) {
           return jsonToolResponse({ error: "empty_list", message: "No substances provided." });
+        }
+        if (names.length > MAX_BATCH_SUBSTANCES) {
+          return jsonToolResponse({
+            error: "too_many",
+            message: `Maximum ${MAX_BATCH_SUBSTANCES} substances per request. Split into multiple calls.`,
+          });
         }
 
         const results = [];
@@ -640,21 +700,27 @@ export class ChemMCP extends McpAgent<Env> {
 
     this.server.tool(
       "search_chemicals",
-      "Search across chemical safety databases by keyword. Searches SVHC metadata, NIOSH Pocket Guide, GHS classifications, and ICSC data using current D1 schema.",
+      TOOL_CATALOG[2].description,
       {
         query: z
           .string()
+          .trim()
+          .min(1)
+          .max(MAX_QUERY_INPUT_LENGTH)
           .describe(
             "Search keyword (e.g. 'carcinogen', 'respiratory', 'liver', 'skin sensitizer', 'endocrine')"
           ),
         database: z
-          .string()
+          .enum(CHEM_DATABASES)
           .optional()
           .describe(
             "Optional: limit search to 'svhc', 'niosh', 'ghs', 'icsc', or 'all' (default: all)"
           ),
         limit: z
           .number()
+          .finite()
+          .min(1)
+          .max(MAX_SEARCH_RESULTS)
           .optional()
           .describe("Max results (1-25, default 10)"),
       },
@@ -817,23 +883,22 @@ export default {
 
     if (url.pathname === "/" || url.pathname === "/health") {
       return Response.json({
-        name: "Roots by Benda Chemical Safety MCP Server",
-        version: "1.1.0",
+        name: SERVER_NAME,
+        version: SERVER_VERSION,
         status: "healthy",
-        tools: [
-          "check_chemical",
-          "check_svhc_list",
-          "search_chemicals",
-        ],
-        data: {
-          echa_svhc: "SVHC lookup by CAS number",
-          niosh_pocket_guide: "NIOSH occupational safety profiles (REL/PEL/IDLH)",
-          ghs_classifications: "GHS hazard classifications resolved through substance_identifiers",
-          icsc_chemicals: "ICSC chemical safety cards by CAS number",
-          cross_references: "cosmetic ingredients + food additives",
-        },
-        selftest: "/selftest",
-        docs: "https://rootsbybenda.com",
+        description: SERVER_DESCRIPTION,
+        tools: TOOL_CATALOG.map((tool) => tool.name),
+        data: DATA_CATALOG,
+        docs: HOMEPAGE,
+        homepage: HOMEPAGE,
+        source: SOURCE,
+      });
+    }
+
+
+    if (url.pathname === "/.well-known/mcp/server.json") {
+      return Response.json(registryMetadata(), {
+        headers: { "Cache-Control": "public, max-age=300" },
       });
     }
 
@@ -842,19 +907,15 @@ export default {
         "$schema": "https://static.modelcontextprotocol.io/schemas/mcp-server-card/v1.json",
         "version": "1.0",
         "protocolVersion": "2025-06-18",
-        "serverInfo": { "name": "chem-mcp-server", "title": "Roots by Benda Chemical Safety MCP Server", "version": "1.1.0" },
-        "description": "Chemical safety MCP - SVHC, GHS, NIOSH OEL, and ICSC safety data",
+        "serverInfo": { "name": "chem-mcp-server", "title": SERVER_NAME, "version": SERVER_VERSION },
+        "description": SERVER_DESCRIPTION,
         "iconUrl": "https://rootsbybenda.com/icon.png",
         "documentationUrl": "https://rootsbybenda.com",
         "transport": { "type": "streamable-http", "endpoint": "/mcp" },
         "capabilities": { "tools": { "listChanged": true }, "resources": { "subscribe": false, "listChanged": false } },
         "authentication": { "required": false, "schemes": ["bearer"], "note": "Optional API key enables per-user rate limiting" },
         "rateLimit": { "requestsPerMinute": 60, "enforcement": "per-ip-or-user" },
-        "tools": [
-          { "name": "check_chemical", "description": "Look up a chemical substance by name or CAS number. Returns SVHC status, NIOSH occupational exposure data, GHS hazard classification, ICSC data, and cross-referenced safety data." },
-          { "name": "check_svhc_list", "description": "Check one or more chemical substances against the EU ECHA SVHC Candidate List by resolving inputs to CAS." },
-          { "name": "search_chemicals", "description": "Search across chemical safety databases by keyword - SVHC, NIOSH, GHS, and ICSC." }
-        ]
+        "tools": TOOL_CATALOG
       }, { headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" } });
     }
 
