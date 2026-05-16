@@ -1,5 +1,7 @@
 # Roots by Benda — Chemical Safety & Industrial Regulatory Intelligence MCP Server
 
+[![smithery badge](https://smithery.ai/badge/twohalves/chemical-safety)](https://smithery.ai/servers/twohalves/chemical-safety)
+
 **Chemical hazard data from ECHA, NIOSH, GHS, and ICSC in one MCP.** Look up SVHC candidate list status, occupational exposure limits, GHS hazard classifications, and cross-reference into cosmetic and food additive databases — all source-linked and free.
 
 Equivalent data access through commercial platforms (Chemwatch, ScienceDirect Toxicology) costs $10,000+/year. This MCP is free.
