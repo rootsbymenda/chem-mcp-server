@@ -1,5 +1,5 @@
 description: >-
-  Is this chemical SVHC or NIOSH listed? Roots by Benda checks 253 ECHA SVHC substances, 677 NIOSH occupational exposure profiles, 468,165 GHS hazard classifications, 73,252 substance identifiers, ICSC safety cards, and cross-links into 30,553 cosmetic ingredients plus 6,450 food additives. Chemical hazard review across SVHC, GHS, NIOSH, ICSC, and cross-vertical safety in one free MCP. Ask your AI: 'is this chemical SVHC or NIOSH listed?'. Built by one human + Claude. Free. Source-linked.
+  Check chemical hazards across SVHC, NIOSH, GHS, ICSC, cosmetics, and food. Roots by Benda checks 253 ECHA SVHC substances, 677 NIOSH occupational exposure profiles, 468,165 GHS hazard classifications, 73,252 substance identifiers, ICSC safety cards, and cross-links into 30,553 cosmetic ingredients plus 6,450 food additives. Chemical hazard review across SVHC, GHS, NIOSH, ICSC, and cross-vertical safety in one free MCP. Ask your AI: 'is this chemical SVHC or NIOSH listed?'. Built by one human + Claude. Free. Source-linked.
 startCommand:
   type: "http"
   configSchema:
