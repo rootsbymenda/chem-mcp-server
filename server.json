@@ -1,8 +1,12 @@
 {
-  "$schema": "https://registry.modelcontextprotocol.io/schema/server.json",
-  "name": "com.rootsbybenda/chemical-safety",
-  "description": "Chemical safety and industrial regulatory intelligence. Look up any chemical by name or CAS number — get SVHC status, NIOSH occupational exposure data, GHS hazard classification, and ICSC safety cards. 468,165 GHS classifications, 253 SVHC substances, 677 NIOSH profiles. Free. Source-linked.",
-  "version": "1.1.0",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.rootsbymenda/chemical-safety",
+  "description": "Chemical hazard lookup: SVHC, GHS, NIOSH, ICSC. 468K classifications. Free.",
+  "repository": {
+    "url": "https://github.com/rootsbymenda/chem-mcp-server",
+    "source": "github"
+  },
+  "version": "1.1.1",
   "remotes": [
     {
       "type": "streamable-http",
@@ -12,12 +16,5 @@
       "type": "sse",
       "url": "https://chem-mcp-server.rootsbybenda.workers.dev/sse"
     }
-  ],
-  "tools": [
-    { "name": "check_chemical", "description": "Look up a chemical by name or CAS number. Returns SVHC status, NIOSH occupational exposure data (REL/PEL/IDLH), GHS hazard classification, and ICSC safety card data." },
-    { "name": "check_svhc_list", "description": "Screen up to 50 substances against the EU ECHA SVHC Candidate List. Returns which are flagged and why." },
-    { "name": "search_chemicals", "description": "Search chemical safety databases by keyword, hazard type, target organ, or symptom across SVHC, NIOSH, GHS, and ICSC." }
-  ],
-  "homepage": "https://rootsbybenda.com",
-  "contact": "SBD@effortlessai.ai"
+  ]
 }
