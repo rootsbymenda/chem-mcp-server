@@ -2,6 +2,12 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+const READ_ONLY_TOOL_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  openWorldHint: false,
+} as const;
+
 interface Env {
   DB: D1Database;
   MCP_OBJECT: DurableObjectNamespace;
@@ -624,6 +630,7 @@ export class ChemMCP extends McpAgent<Env> {
             "Chemical common name, technical substance name, synonym, or CAS number (Chemical Abstracts Service registry number, e.g. '80-05-7'). Use CAS when available for exact matching across ECHA SVHC, NIOSH, GHS, and ICSC records."
           ),
       },
+      READ_ONLY_TOOL_ANNOTATIONS,
       async ({ query }) => jsonToolResponse(await checkChemicalData(this.env, query))
     );
 
@@ -640,6 +647,7 @@ export class ChemMCP extends McpAgent<Env> {
             "Comma-separated or newline-separated list of chemical names or CAS numbers to screen against the EU ECHA SVHC Candidate List. Include CAS numbers when available because SVHC names may have salts, isomers, or synonym variants."
           ),
       },
+      READ_ONLY_TOOL_ANNOTATIONS,
       async ({ substances }) => {
         const ctx: LookupContext = { warnings: [] };
         const names = substances
@@ -724,6 +732,7 @@ export class ChemMCP extends McpAgent<Env> {
           .optional()
           .describe("Maximum number of chemical records to return (1-25, default 10). Use lower limits for precise regulatory phrases and higher limits for broad hazard discovery."),
       },
+      READ_ONLY_TOOL_ANNOTATIONS,
       async ({ query, database, limit }) => {
         const ctx: LookupContext = { warnings: [] };
         const q = normalizeQuery(query);
